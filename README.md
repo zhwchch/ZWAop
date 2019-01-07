@@ -1,11 +1,12 @@
 # ZWAop
-类似于Aspect的库，但可以添加多个切面，使用汇编完成参数传递和函数调用，效率较高。
+类似于Aspect的库，但可以添加多个切面，使用汇编完成参数传递和函数调用，效率较高，但只支持arm64。
 详细实现原理请参阅：
 [*任意方法的Swizzle的应用之一AOP*](https://www.jianshu.com/p/0eb7238326f5)
 [*任意方法的Swizzle的应用之一AOP(续)*](https://www.jianshu.com/p/171831aed088)
+注：ZWAop本来只是我写JOBridge时顺便做的一个扩展demo，但后来想了想AOP也是常见需求，所以完善了一下封装成可用的库。有兴趣者可参阅
+[*JOBridge之一任意方法的Swizzle*](https://www.jianshu.com/p/905e06eeda7b)
 
-
-#用法
+# 用法
 ```objective-c
 
 - (void)viewDidLoad {
