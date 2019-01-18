@@ -108,7 +108,7 @@ OS_ALWAYS_INLINE NSString *ZWGetMetaSelName(SEL sel) {
 }
 
 /*  0xe0是基础大小，其中包含9个寄存器共0x48，8浮点寄存器共0x80，还有0x18是额外信息，比如frameLength,
-    超过0xe0的部分为栈参数大小
+ 超过0xe0的部分为栈参数大小
  */
 int ZWFrameLength(void **sp) {
     id obj = (__bridge id)(*sp);
@@ -138,7 +138,7 @@ int ZWFrameLength(void **sp) {
     return (int)[sign frameLength];
 }
 
-OS_ALWAYS_INLINE id ZWGetInvocation(NSDictionary *dict, id obj, SEL sel) {
+OS_ALWAYS_INLINE id ZWGetInvocation(__unsafe_unretained NSDictionary *dict, id obj, SEL sel) {
     if (!dict || !obj || !sel) return nil;
     Class class = object_getClass(obj);
     NSString *className = NSStringFromClass(class);
@@ -149,7 +149,7 @@ OS_ALWAYS_INLINE id ZWGetInvocation(NSDictionary *dict, id obj, SEL sel) {
     return Invocation;
 }
 
-OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(NSDictionary *dict, id obj, SEL sel) {
+OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionary *dict, id obj, SEL sel) {
     id ret = ZWGetInvocation(dict, obj, sel);
     if ([ret isKindOfClass:[NSArray class]]) {
         return [ret count];
@@ -178,7 +178,7 @@ IMP ZWGetCurrentImp(id obj, SEL sel) {
     return NULL;
 }
 
-IMP ZWGetAopImp(NSDictionary *Invocation, id obj, SEL sel, NSUInteger index) {
+IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation, id obj, SEL sel, NSUInteger index) {
     id block = ZWGetInvocation(Invocation, obj, sel);
     if ([block isKindOfClass:[NSArray class]]) {
         block = block[index];
@@ -188,39 +188,45 @@ IMP ZWGetAopImp(NSDictionary *Invocation, id obj, SEL sel, NSUInteger index) {
     return (IMP)*(p + 2);
 }
 
+void ZWAopInvocationCall(void **sp, __unsafe_unretained id Invocation, __unsafe_unretained id obj,  __unsafe_unretained id arr, SEL sel, int i, NSInteger frameLenth) __attribute__((optnone)) {
+    ZWGetAopImp(Invocation, obj, sel, i);
+    asm volatile("cbz    x0, LZW_20181107");
+    asm volatile("mov    x17, x0");
+    asm volatile("ldr    x14, %0": "=m"(arr));
+    asm volatile("ldr    x11, %0": "=m"(sp));
+    asm volatile("ldr    x13, %0": "=m"(frameLenth));
+    asm volatile("cbz    x13, LZW_20181110");
+    asm volatile("add    x12, x11, 0xc0");
+    
+    asm volatile("sub    sp, sp, x13");
+    asm volatile("bl     _ZWCopyStackParams");
+    asm volatile("LZW_20181110:");
+    asm volatile("bl     _ZWLoadParams");
+    asm volatile("mov    x1, x14");
+    asm volatile("blr    x17");
+    asm volatile("sub    sp, x29, 0x40");
+    asm volatile("LZW_20181107:");
+}
 
-void ZWAopInvocation(void **sp, NSDictionary *Invocation, ZWAopOption option) {
+void ZWAopInvocation(void **sp, __unsafe_unretained NSDictionary *Invocation, ZWAopOption option) {
     id obj = (__bridge id)(*sp);
     SEL sel = *(sp + 1);
     if (!obj || !sel) return;
     NSInteger count = ZWGetInvocationCount(Invocation, obj, sel);
-    __autoreleasing NSArray *arr = @[obj, [NSValue valueWithPointer:sel], @(option)];
+    NSArray *arr = @[obj, [NSValue valueWithPointer:sel], @(option)];
     NSInteger frameLenth = ZWFrameLength(sp) - 0xe0;
     for (int i = 0; i < count; ++i) {
-        ZWGetAopImp(Invocation, obj, sel, i);
-        asm volatile("cbz    x0, LZW_20181107");
-        asm volatile("mov    x17, x0");
-        asm volatile("ldr    x14, %0": "=m"(arr));
-        asm volatile("ldr    x11, %0": "=m"(sp));
-        asm volatile("ldr    x13, %0": "=m"(frameLenth));
-        asm volatile("cbz    x13, LZW_20181110");
-        asm volatile("add    x12, x11, 0xc0");
-        
-        asm volatile("sub    sp, sp, x13");
-        asm volatile("bl     _ZWCopyStackParams");
-        asm volatile("LZW_20181110:");
-        asm volatile("bl     _ZWLoadParams");
-        asm volatile("mov    x1, x14");
-        asm volatile("blr    x17");
-        asm volatile("sub    sp, x29, 0x1e0");
-        asm volatile("LZW_20181107:");
+        ZWAopInvocationCall(sp, Invocation, obj, arr, sel, i, frameLenth);
     }
 }
 
 void ZWAfterInvocation(void **sp) {
     ZWAopInvocation(sp, _ZWAfterIMP, ZWAopOptionAfter);
 }
-void ZWInvocation(void **sp) {
+/*  本函数关闭编译优化，如果不关闭，sp寄存器的回溯值在不同的优化情况下是不同的，还需要区分比较麻烦，
+ 而且即使开启优化也只有一丢丢的提升，还不如关闭图个方便
+ */
+void ZWInvocation(void **sp) __attribute__((optnone)) {
     __autoreleasing id obj;
     SEL sel;
     void *obj_p = &obj;
