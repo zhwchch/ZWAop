@@ -7,17 +7,65 @@
 //
 
 #import "ZWAop.h"
-#import <objc/runtime.h>
-
-
 
 #if defined(__arm64__)
+
+#import <objc/runtime.h>
+#import <os/lock.h>
+#import <pthread.h>
+
 
 static NSMutableDictionary  *_ZWBeforeIMP;
 static NSMutableDictionary  *_ZWOriginIMP;
 static NSMutableDictionary  *_ZWAfterIMP;
 static NSMutableDictionary  *_ZWAllSigns;
-static NSLock  *_ZWLock;
+static Class _ZWBlockClass;
+
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
+API_AVAILABLE(ios(10.0))
+static os_unfair_lock_t _ZWLock;
+#else
+static pthread_mutex_t _ZWLock;
+#endif
+
+__attribute__((constructor(2018))) void JOInvocationInit() {
+    
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
+    if (@available(iOS 10.0, *)) {
+        _ZWLock = malloc(sizeof(os_unfair_lock));
+        _ZWLock->_os_unfair_lock_opaque = 0;
+    }
+#else
+    pthread_mutex_init(&_ZWLock, NULL);
+#endif
+    _ZWOriginIMP = [NSMutableDictionary dictionary];
+    _ZWBeforeIMP = [NSMutableDictionary dictionary];
+    _ZWAfterIMP = [NSMutableDictionary dictionary];
+    _ZWAllSigns = [NSMutableDictionary dictionary];
+    _ZWBlockClass = NSClassFromString(@"NSBlock");
+}
+
+OS_ALWAYS_INLINE void ZWLock(void *lock) {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
+    if (@available(iOS 10.0, *)) {
+        os_unfair_lock_lock((os_unfair_lock_t)lock);
+    }
+#else
+    pthread_mutex_lock(&lock);
+#endif
+}
+
+OS_ALWAYS_INLINE void ZWUnlock(void *lock) {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
+    if (@available(iOS 10.0, *)) {
+        os_unfair_lock_unlock((os_unfair_lock_t)lock);
+    }
+#else
+    pthread_mutex_unlock(&lock);
+#endif
+}
+
+//MARK:erery invocation
 
 OS_ALWAYS_INLINE void ZWStoreParams(void) {
     asm volatile("str    d7, [x11, #0x88]\n\
@@ -103,10 +151,12 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("ldp    x29, x30, [sp], #0x10");
 }
 
-OS_ALWAYS_INLINE NSString *ZWGetMetaSelName(SEL sel) {
-    return [@"__META_" stringByAppendingString:NSStringFromSelector(sel)];
+OS_ALWAYS_INLINE id ZWGetClassKey(__unsafe_unretained id obj) {
+    return @((NSUInteger)object_getClass(obj));
 }
-
+OS_ALWAYS_INLINE id ZWGetSelectorKey(SEL sel) {
+    return @((NSUInteger)(void *)sel);
+}
 /*  0xe0是基础大小，其中包含9个寄存器共0x48，8浮点寄存器共0x80，还有0x18是额外信息，比如frameLength,
  超过0xe0的部分为栈参数大小
  */
@@ -116,51 +166,50 @@ int ZWFrameLength(void **sp) {
     Class class = object_getClass(obj);
     if (!class || !sel) return 0xe0;
     
-    [_ZWLock lock];
-    NSMutableDictionary *methodSigns = _ZWAllSigns[NSStringFromClass(class)];
-    [_ZWLock unlock];
-    NSString *selName = class_isMetaClass(class) ? ZWGetMetaSelName(sel) : NSStringFromSelector(sel);
-    NSMethodSignature *sign = methodSigns[selName];
-    if (sign) {
-        return (int)[sign frameLength];
-    }
+    id classKey = @((NSUInteger)class);
+    
+    ZWLock(_ZWLock);
+    __unsafe_unretained NSMutableDictionary *methodSigns = _ZWAllSigns[classKey];
+    id selKey = ZWGetSelectorKey(sel);
+    __unsafe_unretained NSMethodSignature *sign = methodSigns[selKey];
+    ZWUnlock(_ZWLock);
+    if (sign)  return (int)[sign frameLength];
     
     Method method = class_isMetaClass(class) ? class_getClassMethod(class, sel) : class_getInstanceMethod(class, sel);
     const char *type = method_getTypeEncoding(method);
     sign = [NSMethodSignature signatureWithObjCTypes:type];
-    [_ZWLock lock];
+    ZWLock(_ZWLock);
     if (!methodSigns) {
-        _ZWAllSigns[NSStringFromClass(class)] = [NSMutableDictionary dictionaryWithObject:sign forKey:selName];
+        _ZWAllSigns[classKey] = [NSMutableDictionary dictionaryWithObject:sign forKey:selKey];
     } else {
-        methodSigns[selName] = sign;
+        methodSigns[selKey] = sign;
     }
-    [_ZWLock unlock];
+    ZWUnlock(_ZWLock);
     return (int)[sign frameLength];
 }
 
-OS_ALWAYS_INLINE id ZWGetInvocation(__unsafe_unretained NSDictionary *dict, id obj, SEL sel) {
-    if (!dict || !obj || !sel) return nil;
-    Class class = object_getClass(obj);
-    NSString *className = NSStringFromClass(class);
-    NSString *selName = class_isMetaClass(class) ? ZWGetMetaSelName(sel) : NSStringFromSelector(sel);
-    [_ZWLock lock];
-    id Invocation = dict[className][selName];
-    [_ZWLock unlock];
+OS_ALWAYS_INLINE id ZWGetInvocation(__unsafe_unretained NSDictionary *dict, __unsafe_unretained id obj, SEL sel) {
+    if (!obj || !sel) return nil;
+    ZWLock(_ZWLock);
+    __unsafe_unretained id Invocation = dict[ZWGetClassKey(obj)][ZWGetSelectorKey(sel)];
+    ZWUnlock(_ZWLock);
     return Invocation;
 }
 
-OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionary *dict, id obj, SEL sel) {
-    id ret = ZWGetInvocation(dict, obj, sel);
+OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionary *dict,
+                                                 __unsafe_unretained id obj,
+                                                 SEL sel) {
+    __unsafe_unretained id ret = ZWGetInvocation(dict, obj, sel);
     if ([ret isKindOfClass:[NSArray class]]) {
         return [ret count];
-    } else if ([ret isKindOfClass:NSClassFromString(@"NSBlock")]) {
+    } else if ([ret isKindOfClass:_ZWBlockClass]) {
         return 1;
     }
     return 0;
 }
 
 IMP ZWGetOriginImp(id obj, SEL sel) {
-    id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
+    __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
     if ([Invocation isKindOfClass:[NSValue class]]) {
         return [Invocation pointerValue];
     }
@@ -168,8 +217,8 @@ IMP ZWGetOriginImp(id obj, SEL sel) {
 }
 
 IMP ZWGetCurrentImp(id obj, SEL sel) {
-    id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
-    if ([Invocation isKindOfClass:NSClassFromString(@"NSBlock")]) {
+    __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
+    if ([Invocation isKindOfClass:_ZWBlockClass]) {
         
         if (!Invocation) return NULL;
         uint64_t *p = (__bridge void *)(Invocation);
@@ -179,7 +228,7 @@ IMP ZWGetCurrentImp(id obj, SEL sel) {
 }
 
 IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation, id obj, SEL sel, NSUInteger index) {
-    id block = ZWGetInvocation(Invocation, obj, sel);
+    __unsafe_unretained id block = ZWGetInvocation(Invocation, obj, sel);
     if ([block isKindOfClass:[NSArray class]]) {
         block = block[index];
     }
@@ -188,7 +237,13 @@ IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation, id obj, SEL sel, N
     return (IMP)*(p + 2);
 }
 
-void ZWAopInvocationCall(void **sp, __unsafe_unretained id Invocation, __unsafe_unretained id obj,  __unsafe_unretained id arr, SEL sel, int i, NSInteger frameLenth) __attribute__((optnone)) {
+void ZWAopInvocationCall(void **sp,
+                         __unsafe_unretained id Invocation,
+                         __unsafe_unretained id obj,
+                         __unsafe_unretained id arr,
+                         SEL sel,
+                         int i,
+                         NSInteger frameLenth) __attribute__((optnone)) {
     ZWGetAopImp(Invocation, obj, sel, i);
     asm volatile("cbz    x0, LZW_20181107");
     asm volatile("mov    x17, x0");
@@ -231,7 +286,7 @@ void ZWInvocation(void **sp) __attribute__((optnone)) {
     SEL sel;
     void *obj_p = &obj;
     void *sel_p = &sel;
-    NSInteger frameLenth = ZWFrameLength(sp)- 0xe0;
+    NSInteger frameLenth = ZWFrameLength(sp) - 0xe0;
     
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x10, %0": "=m"(obj_p));
@@ -290,6 +345,9 @@ void ZWBeforeInvocation(void **sp) {
     ZWAopInvocation(sp, _ZWBeforeIMP, ZWAopOptionBefore);
 }
 
+
+//MARK:register or remove
+
 OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     unsigned int count = 0;
     Method retMethod = NULL;
@@ -306,15 +364,19 @@ OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     return retMethod;
 }
 
-OS_ALWAYS_INLINE void ZWAddInvocation(NSMutableDictionary *dict, NSString *className, NSString *selName, id block,  ZWAopOption options) {
-    NSArray *tmp = dict[className][selName];
+OS_ALWAYS_INLINE void ZWAddInvocation(__unsafe_unretained NSMutableDictionary *dict,
+                                      __unsafe_unretained NSNumber *classKey,
+                                      __unsafe_unretained NSNumber *selKey,
+                                      __unsafe_unretained id block,
+                                      ZWAopOption options) {
+    NSArray *tmp = dict[classKey][selKey];
     if (options & ZWAopOptionOnly) {
-        dict[className][selName] = block;
+        dict[classKey][selKey] = block;
     } else {
         if ([tmp isKindOfClass:[NSArray class]]) {
-            dict[className][selName] = [tmp arrayByAddingObject:block];
+            dict[classKey][selKey] = [tmp arrayByAddingObject:block];
         } else if (!tmp) {
-            dict[className][selName] = @[block];
+            dict[classKey][selKey] = @[block];
         }
     }
 }
@@ -325,78 +387,73 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
         || options == ZWAopOptionMeta
         || options == (ZWAopOptionMeta | ZWAopOptionOnly)) return nil;
     
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        _ZWOriginIMP = [NSMutableDictionary dictionary];
-        _ZWBeforeIMP = [NSMutableDictionary dictionary];
-        _ZWAfterIMP = [NSMutableDictionary dictionary];
-        _ZWAllSigns = [NSMutableDictionary dictionary];
-        _ZWLock = [[NSLock alloc] init];
-    });
     
     Class class = object_isClass(obj) ? obj : object_getClass(obj);
     if (options & ZWAopOptionMeta) {
         class = class_isMetaClass(class) ? class : object_getClass(obj);
     }
     
-    NSString *className = NSStringFromClass(class);
+    NSNumber *classKey = @((NSUInteger)class);
     Method method = ZWGetMethod(class, sel);//class_getInstanceMethod(class, sel)会获取父类的方法
     IMP originImp = method_getImplementation(method);
-    NSString *selName = class_isMetaClass(class) ? ZWGetMetaSelName(sel) : NSStringFromSelector(sel);
-    if (!className || !selName) return nil;
+    NSNumber *selKey = ZWGetSelectorKey(sel);
     
-    [_ZWLock lock];
-    if (!_ZWOriginIMP[className]) {
-        _ZWOriginIMP[className] = [NSMutableDictionary dictionary];
-        _ZWBeforeIMP[className] = [NSMutableDictionary dictionary];
-        _ZWAfterIMP[className] = [NSMutableDictionary dictionary];
+    
+    ZWLock(_ZWLock);
+    if (!_ZWOriginIMP[classKey]) {
+        _ZWOriginIMP[classKey] = [NSMutableDictionary dictionary];
+        _ZWBeforeIMP[classKey] = [NSMutableDictionary dictionary];
+        _ZWAfterIMP[classKey] = [NSMutableDictionary dictionary];
     }
     
     if (options & ZWAopOptionReplace) {
-        _ZWOriginIMP[className][selName] = block;
+        _ZWOriginIMP[classKey][selKey] = block;
     } else {
         if (originImp != ZWGlobalOCSwizzle) {
-            _ZWOriginIMP[className][selName] = [NSValue valueWithPointer:originImp];
+            _ZWOriginIMP[classKey][selKey] = [NSValue valueWithPointer:originImp];
         }
     }
     
     if (options & ZWAopOptionBefore) {
-        ZWAddInvocation(_ZWBeforeIMP, className, selName, block, options);
+        ZWAddInvocation(_ZWBeforeIMP, classKey, selKey, block, options);
     }
     if (options & ZWAopOptionAfter) {
-        ZWAddInvocation(_ZWAfterIMP, className, selName, block, options);
+        ZWAddInvocation(_ZWAfterIMP, classKey, selKey, block, options);
     }
-    [_ZWLock unlock];
+    ZWUnlock(_ZWLock);
     method_setImplementation(method, ZWGlobalOCSwizzle);
     
     return block;
 }
 
-OS_ALWAYS_INLINE void ZWRemoveInvocation(NSMutableDictionary *dict, NSString *className, id identifier, ZWAopOption options) {
+OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained NSMutableDictionary *dict,
+                                         __unsafe_unretained NSNumber *classKey,
+                                         __unsafe_unretained id identifier,
+                                         ZWAopOption options) {
     if (!identifier) {
-        dict[className] = [NSMutableDictionary dictionary];
+        dict[classKey] = [NSMutableDictionary dictionary];
         return;
     }
     
-    NSArray *allKeys = [dict[className] allKeys];
-    for (NSString *key in allKeys) {
-        id obj = dict[className][key];
-        if ([obj isKindOfClass:NSClassFromString(@"NSBlock")]) {
+    NSArray *allKeys = [dict[classKey] allKeys];
+    for (NSNumber *key in allKeys) {
+        id obj = dict[classKey][key];
+        if ([obj isKindOfClass:_ZWBlockClass]) {
             if (obj == identifier) {
-                dict[className][key] = nil;
+                dict[classKey][key] = nil;
             }
         } else if ([obj isKindOfClass:[NSArray class]]) {
             NSMutableArray *arr = [NSMutableArray array];
             for (id block in obj) {
                 if (block != identifier) {
                     if (options & ZWAopOptionRemoveAop) {
-                        dict[className][key] = nil;
+                        dict[classKey][key] = nil;
                         break;
                     }
                     [arr addObject:block];
                 }
             }
-            dict[className][key] = [arr copy];;
+            dict[classKey][key] = [arr copy];;
         }
     }
 }
@@ -408,23 +465,24 @@ void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {
     if (options & ZWAopOptionMeta) {
         class = class_isMetaClass(class) ? class : object_getClass(obj);
     }
-    NSString *className = NSStringFromClass(class);
-
-    [_ZWLock lock];
+    NSNumber *classKey = @((NSUInteger)class);
+    
+    ZWLock(_ZWLock);
     if (options & ZWAopOptionReplace) {
-        ZWRemoveInvocation(_ZWOriginIMP, className, identifier, options);
+        ZWRemoveInvocation(_ZWOriginIMP, classKey, identifier, options);
     }
     
     if (options & ZWAopOptionBefore) {
-        ZWRemoveInvocation(_ZWBeforeIMP, className, identifier, options);
+        ZWRemoveInvocation(_ZWBeforeIMP, classKey, identifier, options);
     }
     
     if (options & ZWAopOptionAfter) {
-        ZWRemoveInvocation(_ZWAfterIMP, className, identifier, options);
+        ZWRemoveInvocation(_ZWAfterIMP, classKey, identifier, options);
     }
-    [_ZWLock unlock];
+    ZWUnlock(_ZWLock);
 }
 
+//MARK:convenient api
 
 id ZWAddAopBefore(id obj, SEL sel, id block) {
     return ZWAddAop(obj, sel, ZWAopOptionBefore, block);
@@ -440,7 +498,7 @@ id ZWAddAopBeforeAndAfter(id obj, SEL sel, id block) {
     return ZWAddAop(obj, sel, ZWAopOptionBefore | ZWAopOptionAfter, block);
 }
 id ZWAddAopAll(id obj, SEL sel, id block) {
-    return ZWAddAop(obj, sel, ZWAopOptionDefault, block);
+    return ZWAddAop(obj, sel, ZWAopOptionAll, block);
 }
 
 void ZWRemoveAopClass(id obj, ZWAopOption options) {
@@ -449,7 +507,9 @@ void ZWRemoveAopClass(id obj, ZWAopOption options) {
 void ZWRemoveAopClassMethod(id obj, id identifier, ZWAopOption options) {
     return ZWRemoveAop(obj, identifier, options | ZWAopOptionRemoveAop);
 }
+
 #else
+//MARK:placeholder
 id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {}
 void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {}
 id ZWAddAopBefore(id obj, SEL sel, id block){}
