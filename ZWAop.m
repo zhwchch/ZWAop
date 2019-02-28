@@ -193,19 +193,19 @@ OS_ALWAYS_INLINE NSUInteger ZWFrameLength(__unsafe_unretained id obj, SEL sel) {
     return frameLength;
 }
 
-OS_ALWAYS_INLINE id ZWGetInvocation(__unsafe_unretained NSDictionary *dict, __unsafe_unretained id obj, SEL sel) {
+OS_ALWAYS_INLINE void *ZWGetInvocation(__unsafe_unretained NSDictionary *dict, __unsafe_unretained id obj, SEL sel) {
     if (!obj || !sel) return nil;
     ZWLock(_ZWLock);
     __unsafe_unretained id invocation = dict[(id<NSCopying>)object_getClass(obj)][@((NSUInteger)(void *)sel)];
     ZWUnlock(_ZWLock);
-    return invocation;
+    return (__bridge void *)invocation;
 }
 
 OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionary *dict,
                                                  __unsafe_unretained id *retValue,
                                                  __unsafe_unretained id obj,
                                                  SEL sel) {
-    __unsafe_unretained id ret = ZWGetInvocation(dict, obj, sel);
+    __unsafe_unretained id ret = (__bridge id)ZWGetInvocation(dict, obj, sel);
     if (OS_EXPECT(retValue != nil, 1)) *retValue = ret;
     
     if (OS_EXPECT([ret isKindOfClass:[NSArray class]], 0)) {
@@ -217,35 +217,38 @@ OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionar
 }
 
 OS_ALWAYS_INLINE IMP ZWGetOriginImp(__unsafe_unretained id obj, SEL sel) {
-    __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
-    if (OS_EXPECT([Invocation isKindOfClass:[NSValue class]], 1)) {
-        return [Invocation pointerValue];
+    __unsafe_unretained id invocation = (__bridge id)ZWGetInvocation(_ZWOriginIMP, obj, sel);
+    if (OS_EXPECT([invocation isKindOfClass:[NSValue class]], 1)) {
+        return [invocation pointerValue];
     }
     return NULL;
 }
 
 OS_ALWAYS_INLINE IMP ZWGetCurrentImp(__unsafe_unretained id obj, SEL sel) {
-    __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
-    if (OS_EXPECT([Invocation isKindOfClass:_ZWBlockClass], 1)) {
-        uint64_t *p = (__bridge void *)(Invocation);
+    __unsafe_unretained id invocation = (__bridge id)ZWGetInvocation(_ZWOriginIMP, obj, sel);
+    if (OS_EXPECT([invocation isKindOfClass:_ZWBlockClass], 1)) {
+        uint64_t *p = (__bridge void *)(invocation);
         return (IMP)*(p + 2);
     }
     return NULL;
 }
 
-IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation,
-                __unsafe_unretained id block,
+IMP ZWGetAopImp(__unsafe_unretained NSDictionary *invocation,
+                __unsafe_unretained id blocks,
+                void **block,
                 __unsafe_unretained id obj,
                 SEL sel,
                 NSUInteger index) {
-    if (OS_EXPECT(!block, 0)) {
-        block = ZWGetInvocation(Invocation, obj, sel);
+    if (OS_EXPECT(!blocks, 0)) {
+        blocks = (__bridge id)ZWGetInvocation(invocation, obj, sel);
     }
-    if (OS_EXPECT([block isKindOfClass:[NSArray class]], 0)) {
-        block = block[index];
+    if (OS_EXPECT([blocks isKindOfClass:[NSArray class]], 0)) {
+        blocks = blocks[index];
     }
-    if (OS_EXPECT(!block, 0)) return NULL;
-    uint64_t *p = (__bridge void *)(block);
+    if (OS_EXPECT(!blocks, 0)) return NULL;
+    uint64_t *p = (__bridge void *)(blocks);
+    if (block) *block = (__bridge void *)blocks;
+    
     return (IMP)*(p + 2);
 }
 
@@ -257,14 +260,15 @@ void ZWAopInvocationCall(void **sp,
                          ZWAopInfo *infoP,
                          int i,
                          NSInteger frameLenth) __attribute__((optnone)) {
-    
-    ZWGetAopImp(allInvocation, invocations, obj, sel, i);
+    void *block = NULL;
+    ZWGetAopImp(allInvocation, invocations, &block, obj, sel, i);
     
     asm volatile("cbz    x0, LZW_20181107");
     asm volatile("mov    x17, x0");
     asm volatile("ldr    x14, %0": "=m"(infoP));
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
+    asm volatile("ldr    x15, %0": "=m"(block));
     asm volatile("cbz    x13, LZW_20181110");
     asm volatile("add    x12, x11, 0xc0");
     
@@ -273,8 +277,9 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("LZW_20181110:");
     asm volatile("bl     _ZWLoadParams");
     asm volatile("mov    x1, x14");
+    asm volatile("mov    x0, x15");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x40");
+    asm volatile("sub    sp, x29, 0x50");
     asm volatile("LZW_20181107:");
 }
 
@@ -282,7 +287,7 @@ OS_ALWAYS_INLINE NSInteger ZWAopInvocation(void **sp,
                                            __unsafe_unretained NSDictionary *allInvocation,
                                            ZWAopOption option,
                                            NSInteger *frameLengthPtr) {
-    id obj = (__bridge id)(*sp);
+    __unsafe_unretained id obj = (__bridge id)(*sp);
     SEL sel = *(sp + 1);
     if (OS_EXPECT(!obj || !sel, 0)) return 0;
     __unsafe_unretained id invocations = nil;
