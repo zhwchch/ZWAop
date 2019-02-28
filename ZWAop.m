@@ -13,6 +13,9 @@
 #import <os/lock.h>
 #import <pthread.h>
 
+#define ZWGlobalOCSwizzleStackSize  "#0xe0"
+#define ZWInvocationStackSize  "#0x50"
+#define ZWAopInvocationCallStackSize "#0x50"
 
 /*  选用NSDictionary字典作为关联容器，其查询插入效率很高。使用CFDictionaryRef替代意义不大，
  CFDictionaryCreateMutable创建效率比[NSMutableDictionary dictionary]低很多，使用
@@ -136,7 +139,7 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("stp    x29, x30, [sp, #-0x10]!");
     
     asm volatile("mov    x29, sp\n\
-                 sub    sp, sp, #0xb0");
+                 sub    sp, sp, " ZWGlobalOCSwizzleStackSize);
     
     asm volatile("mov    x11, sp");
     asm volatile("bl    _ZWStoreParams");
@@ -144,19 +147,35 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWBeforeInvocation");
     
+    asm volatile("str    x0, [sp, #0xa0]");
     asm volatile("mov    x1, x0");
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWInvocation");
     
-    asm volatile("str    x0, [sp, #0xa0]");
-    asm volatile("str    d0, [sp, #0xa8]");
+    /*  存储可能的返回值。正常情况下只会用到x0，d0。但对于NSRange这种大于8Byte小于16Byte的整型返回值，
+     则通过x0，x1返回，对于大于16Byte的整型通过x8间接寻址返回。浮点数通过d0返回，CGRect通过d0-d3返回，
+     浮点数最多4个，否则也间接寻址返回。
+     */
+    asm volatile("str    x0, [sp, #0xa8]");
+    asm volatile("str    x1, [sp, #0xb0]");
+    asm volatile("str    x8, [sp, #0xb8]");
+    asm volatile("str    d0, [sp, #0xc0]");
+    asm volatile("str    d1, [sp, #0xc8]");
+    asm volatile("str    d2, [sp, #0xd0]");
+    asm volatile("str    d3, [sp, #0xd8]");
     
-    asm volatile("mov    x1, x9");
+    asm volatile("ldr    x1, [sp, #0xa0]");
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWAfterInvocation");
     
-    asm volatile("ldr    x0, [sp, #0xa0]");
-    asm volatile("ldr    d0, [sp, #0xa8]");
+    //恢复返回值
+    asm volatile("ldr    x0, [sp, #0xa8]");
+    asm volatile("ldr    x1, [sp, #0xb0]");
+    asm volatile("ldr    x8, [sp, #0xb8]");
+    asm volatile("ldr    d0, [sp, #0xc0]");
+    asm volatile("ldr    d1, [sp, #0xc8]");
+    asm volatile("ldr    d2, [sp, #0xd0]");
+    asm volatile("ldr    d3, [sp, #0xd8]");
     
     asm volatile("mov    sp, x29");
     asm volatile("ldp    x29, x30, [sp], #0x10");
@@ -269,7 +288,8 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
     asm volatile("ldr    x15, %0": "=m"(block));
     asm volatile("cbz    x13, LZW_20181110");
-    asm volatile("add    x12, x11, 0xc0");
+    asm volatile("add    x12, x11, " ZWGlobalOCSwizzleStackSize);
+    asm volatile("add    x12, x12, 0x10");//ZWGlobalOCSwizzleStackSize + 0x10
     
     asm volatile("sub    sp, sp, x13");
     asm volatile("bl     _ZWCopyStackParams");
@@ -278,7 +298,7 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("mov    x1, x14");
     asm volatile("mov    x0, x15");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x50");
+    asm volatile("sub    sp, x29, " ZWAopInvocationCallStackSize);
     asm volatile("LZW_20181107:");
 }
 
@@ -347,7 +367,8 @@ void ZWInvocation(void **sp, NSInteger frameLenth) __attribute__((optnone)) {
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
     asm volatile("cbz    x13, LZW_20181111");
-    asm volatile("add    x12, x11, 0xc0");//0xb0 + 0x10
+    asm volatile("add    x12, x11, " ZWGlobalOCSwizzleStackSize);
+    asm volatile("add    x12, x12, 0x10");//ZWGlobalOCSwizzleStackSize + 0x10
     
     asm volatile("sub    sp, sp, x13");
     asm volatile("bl     _ZWCopyStackParams");
@@ -355,7 +376,7 @@ void ZWInvocation(void **sp, NSInteger frameLenth) __attribute__((optnone)) {
     asm volatile("bl     _ZWLoadParams");
     asm volatile("mov    x1, x14");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x50");
+    asm volatile("sub    sp, x29, " ZWInvocationStackSize);
     asm volatile("b      LZW_20181106");
     
     asm volatile("LZW_20181105:");
@@ -363,15 +384,15 @@ void ZWInvocation(void **sp, NSInteger frameLenth) __attribute__((optnone)) {
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
     asm volatile("cbz    x13, LZW_20181112");
-    asm volatile("add    x12, x11, 0xc0");
+    asm volatile("add    x12, x11, " ZWGlobalOCSwizzleStackSize);
+    asm volatile("add    x12, x12, 0x10");//ZWGlobalOCSwizzleStackSize + 0x10
     asm volatile("sub    sp, sp, x13");
     asm volatile("bl     _ZWCopyStackParams");
     asm volatile("LZW_20181112:");
     asm volatile("bl     _ZWLoadParams");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x50");
+    asm volatile("sub    sp, x29, " ZWInvocationStackSize);
     asm volatile("LZW_20181106:");
-    asm volatile("ldr    x9, [x29, #-0x10]");//回传frameLength给ZWAfterInvocation使用
 }
 
 
