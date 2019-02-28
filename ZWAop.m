@@ -15,6 +15,16 @@
 #import <pthread.h>
 
 
+/*  选用NSDictionary字典作为关联容器，其查询插入效率很高。使用CFDictionaryRef替代意义不大，
+ CFDictionaryCreateMutable创建效率比[NSMutableDictionary dictionary]低很多，使用
+ 也没有NSDictionary方便，效率也高不了多少。最重要的是CFDictionaryRef也要求key和value
+ 为对象，所以不能使用selector作为key，只能将selector封装成NSNumber再使用，所以无法通过
+ 避免创建对象来降低开销，不过好消息是NSNumber创建开销较小。（在队上分配内存是比较昂贵的操作，
+ 特别是大量分配（万次/秒），在这里频繁调用的场景尤其明显。）
+ 另外：CFDictionaryGetKeysAndValues这个函数似乎有bug，拿到的key和value数组不太对。
+ 目前该方案一半的开销开销在字典的查询上，想要再有明显优化就需要自定义容器了。或者想要再更大
+ 的提升，就得从实现原理入手了。
+ */
 static NSMutableDictionary  *_ZWBeforeIMP;
 static NSMutableDictionary  *_ZWOriginIMP;
 static NSMutableDictionary  *_ZWAfterIMP;
@@ -28,7 +38,7 @@ static os_unfair_lock_t _ZWLock;
 static pthread_mutex_t _ZWLock;
 #endif
 
-__attribute__((constructor(2018))) void JOInvocationInit() {
+__attribute__((constructor(2018))) void ZWInvocationInit() {
     
 #if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
     if (@available(iOS 10.0, *)) {
@@ -65,7 +75,7 @@ OS_ALWAYS_INLINE void ZWUnlock(void *lock) {
 #endif
 }
 
-//MARK:erery invocation
+#pragma mark - erery invocation
 
 OS_ALWAYS_INLINE void ZWStoreParams(void) {
     asm volatile("str    d7, [x11, #0x88]\n\
@@ -135,12 +145,14 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWBeforeInvocation");
     
+    asm volatile("mov    x1, x0");
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWInvocation");
     
     asm volatile("str    x0, [sp, #0xa0]");
     asm volatile("str    d0, [sp, #0xa8]");
     
+    asm volatile("mov    x1, x0");
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWAfterInvocation");
     
@@ -151,98 +163,106 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("ldp    x29, x30, [sp], #0x10");
 }
 
-OS_ALWAYS_INLINE id ZWGetSelectorKey(SEL sel) {
-    return @((NSUInteger)(void *)sel);
-}
 /*  0xe0是基础大小，其中包含9个寄存器共0x48，8浮点寄存器共0x80，还有0x18是额外信息，比如frameLength,
  超过0xe0的部分为栈参数大小
  */
-int ZWFrameLength(void **sp) {
-    id obj = (__bridge id)(*sp);
-    SEL sel = *(sp + 1);
+OS_ALWAYS_INLINE NSUInteger ZWFrameLength(__unsafe_unretained id obj, SEL sel) {
     Class class = object_getClass(obj);
-    if (!class || !sel) return 0xe0;
+    if (OS_EXPECT(!class || !sel, 0)) return 0xe0;
     
     ZWLock(_ZWLock);
     __unsafe_unretained NSMutableDictionary *methodSigns = _ZWAllSigns[(id<NSCopying>)class];
-    id selKey = ZWGetSelectorKey(sel);
-    __unsafe_unretained NSMethodSignature *sign = methodSigns[selKey];
+    //利用Tagged Pointer机制，选用NSNumber包裹selector地址常量作为key，效率比使用字符串高很多
+    id selKey = @((NSUInteger)(void *)sel);
+    __unsafe_unretained NSNumber *num = methodSigns[selKey];
     ZWUnlock(_ZWLock);
-    if (sign)  return (int)[sign frameLength];
+    if (OS_EXPECT(num != nil, 1))  return [num unsignedLongLongValue];
     
     Method method = class_isMetaClass(class) ? class_getClassMethod(class, sel) : class_getInstanceMethod(class, sel);
     const char *type = method_getTypeEncoding(method);
-    sign = [NSMethodSignature signatureWithObjCTypes:type];
+    NSMethodSignature *sign = [NSMethodSignature signatureWithObjCTypes:type];
+    NSUInteger frameLength = [sign frameLength];
+    
     ZWLock(_ZWLock);
-    if (!methodSigns) {
-        _ZWAllSigns[(id<NSCopying>)class] = [NSMutableDictionary dictionaryWithObject:sign forKey:selKey];
+    if (OS_EXPECT(!methodSigns, 0)) {
+        _ZWAllSigns[(id<NSCopying>)class] = [NSMutableDictionary dictionaryWithObject:@(frameLength) forKey:selKey];
     } else {
-        methodSigns[selKey] = sign;
+        methodSigns[selKey] = @(frameLength);
     }
     ZWUnlock(_ZWLock);
-    return (int)[sign frameLength];
+    return frameLength;
 }
 
 OS_ALWAYS_INLINE id ZWGetInvocation(__unsafe_unretained NSDictionary *dict, __unsafe_unretained id obj, SEL sel) {
     if (!obj || !sel) return nil;
     ZWLock(_ZWLock);
-    __unsafe_unretained id Invocation = dict[(id<NSCopying>)object_getClass(obj)][ZWGetSelectorKey(sel)];
+    __unsafe_unretained id invocation = dict[(id<NSCopying>)object_getClass(obj)][@((NSUInteger)(void *)sel)];
     ZWUnlock(_ZWLock);
-    return Invocation;
+    return invocation;
 }
 
 OS_ALWAYS_INLINE NSUInteger ZWGetInvocationCount(__unsafe_unretained NSDictionary *dict,
+                                                 __unsafe_unretained id *retValue,
                                                  __unsafe_unretained id obj,
                                                  SEL sel) {
     __unsafe_unretained id ret = ZWGetInvocation(dict, obj, sel);
-    if ([ret isKindOfClass:[NSArray class]]) {
+    if (OS_EXPECT(retValue != nil, 1)) *retValue = ret;
+    
+    if (OS_EXPECT([ret isKindOfClass:[NSArray class]], 0)) {
         return [ret count];
-    } else if ([ret isKindOfClass:_ZWBlockClass]) {
+    } else if (OS_EXPECT([ret isKindOfClass:_ZWBlockClass], 1)) {
         return 1;
     }
     return 0;
 }
 
-IMP ZWGetOriginImp(id obj, SEL sel) {
+OS_ALWAYS_INLINE IMP ZWGetOriginImp(__unsafe_unretained id obj, SEL sel) {
     __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
-    if ([Invocation isKindOfClass:[NSValue class]]) {
+    if (OS_EXPECT([Invocation isKindOfClass:[NSValue class]], 1)) {
         return [Invocation pointerValue];
     }
     return NULL;
 }
 
-IMP ZWGetCurrentImp(id obj, SEL sel) {
+OS_ALWAYS_INLINE IMP ZWGetCurrentImp(__unsafe_unretained id obj, SEL sel) {
     __unsafe_unretained id Invocation = ZWGetInvocation(_ZWOriginIMP, obj, sel);
-    if ([Invocation isKindOfClass:_ZWBlockClass]) {
-        
-        if (!Invocation) return NULL;
+    if (OS_EXPECT([Invocation isKindOfClass:_ZWBlockClass], 1)) {
         uint64_t *p = (__bridge void *)(Invocation);
         return (IMP)*(p + 2);
     }
     return NULL;
 }
 
-IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation, id obj, SEL sel, NSUInteger index) {
-    __unsafe_unretained id block = ZWGetInvocation(Invocation, obj, sel);
-    if ([block isKindOfClass:[NSArray class]]) {
+IMP ZWGetAopImp(__unsafe_unretained NSDictionary *Invocation,
+                __unsafe_unretained id block,
+                __unsafe_unretained id obj,
+                SEL sel,
+                NSUInteger index) {
+    if (OS_EXPECT(!block, 0)) {
+        block = ZWGetInvocation(Invocation, obj, sel);
+    }
+    if (OS_EXPECT([block isKindOfClass:[NSArray class]], 0)) {
         block = block[index];
     }
-    if (!block) return NULL;
+    if (OS_EXPECT(!block, 0)) return NULL;
     uint64_t *p = (__bridge void *)(block);
     return (IMP)*(p + 2);
 }
 
 void ZWAopInvocationCall(void **sp,
-                         __unsafe_unretained id Invocation,
+                         __unsafe_unretained id allInvocation,
+                         __unsafe_unretained id invocations,
                          __unsafe_unretained id obj,
-                         __unsafe_unretained id arr,
                          SEL sel,
+                         ZWAopInfo *infoP,
                          int i,
                          NSInteger frameLenth) __attribute__((optnone)) {
-    ZWGetAopImp(Invocation, obj, sel, i);
+    
+    ZWGetAopImp(allInvocation, invocations, obj, sel, i);
+    
     asm volatile("cbz    x0, LZW_20181107");
     asm volatile("mov    x17, x0");
-    asm volatile("ldr    x14, %0": "=m"(arr));
+    asm volatile("ldr    x14, %0": "=m"(infoP));
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
     asm volatile("cbz    x13, LZW_20181110");
@@ -258,30 +278,40 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("LZW_20181107:");
 }
 
-void ZWAopInvocation(void **sp, __unsafe_unretained NSDictionary *Invocation, ZWAopOption option) {
+OS_ALWAYS_INLINE NSInteger ZWAopInvocation(void **sp,
+                                           __unsafe_unretained NSDictionary *allInvocation,
+                                           ZWAopOption option,
+                                           NSInteger *frameLengthPtr) {
     id obj = (__bridge id)(*sp);
     SEL sel = *(sp + 1);
-    if (!obj || !sel) return;
-    NSInteger count = ZWGetInvocationCount(Invocation, obj, sel);
-    NSArray *arr = @[obj, [NSValue valueWithPointer:sel], @(option)];
-    NSInteger frameLenth = ZWFrameLength(sp) - 0xe0;
+    if (OS_EXPECT(!obj || !sel, 0)) return 0;
+    __unsafe_unretained id invocations = nil;
+    NSInteger count = ZWGetInvocationCount(allInvocation, &invocations, obj, sel);
+    
+    //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
+    ZWAopInfo info = {obj, sel, option};
+    NSInteger frameLength = frameLengthPtr ? *frameLengthPtr : ZWFrameLength(obj, sel) - 0xe0;
     for (int i = 0; i < count; ++i) {
-        ZWAopInvocationCall(sp, Invocation, obj, arr, sel, i, frameLenth);
+        ZWAopInvocationCall(sp, allInvocation, invocations, obj, sel, &info, i, frameLength);
     }
+    return frameLength;
 }
 
-void ZWAfterInvocation(void **sp) {
-    ZWAopInvocation(sp, _ZWAfterIMP, ZWAopOptionAfter);
+OS_ALWAYS_INLINE NSInteger ZWBeforeInvocation(void **sp) {
+    return ZWAopInvocation(sp, _ZWBeforeIMP, ZWAopOptionBefore, NULL);
 }
+
+void ZWManualPlaceholder() __attribute__((optnone)) {}
 /*  本函数关闭编译优化，如果不关闭，sp寄存器的回溯值在不同的优化情况下是不同的，还需要区分比较麻烦，
- 而且即使开启优化也只有一丢丢的提升，还不如关闭图个方便
+ 而且即使开启优化也只有一丢丢的提升，还不如关闭图个方便。ZWManualPlaceholder占位函数，仅为触发
+ Xcode插入x29, x30, [sp, #-0x10]!记录fp, lr。
  */
-void ZWInvocation(void **sp) __attribute__((optnone)) {
-    __autoreleasing id obj;
+void ZWInvocation(void **sp, NSInteger frameLenth) __attribute__((optnone)) {
+    __unsafe_unretained id obj;
     SEL sel;
     void *obj_p = &obj;
     void *sel_p = &sel;
-    NSInteger frameLenth = ZWFrameLength(sp) - 0xe0;
+    ZWManualPlaceholder();
     
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x10, %0": "=m"(obj_p));
@@ -297,8 +327,9 @@ void ZWInvocation(void **sp) __attribute__((optnone)) {
     asm volatile("bl     _ZWGetOriginImp");
     asm volatile("cbnz   x0, LZW_20181105");
     
-    __autoreleasing NSArray *arr = @[obj, [NSValue valueWithPointer:sel], @(ZWAopOptionReplace)];
-    
+    //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
+    ZWAopInfo info = {obj, sel, ZWAopOptionReplace};
+    void *infoP = &info;
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x0, [x11]");
     asm volatile("ldr    x1, [x11, #0x8]");
@@ -306,7 +337,7 @@ void ZWInvocation(void **sp) __attribute__((optnone)) {
     asm volatile("cbz    x0, LZW_20181106");
     
     asm volatile("mov    x17, x0");
-    asm volatile("ldr    x14, %0": "=m"(arr));
+    asm volatile("ldr    x14, %0": "=m"(infoP));
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
     asm volatile("cbz    x13, LZW_20181111");
@@ -318,7 +349,7 @@ void ZWInvocation(void **sp) __attribute__((optnone)) {
     asm volatile("bl     _ZWLoadParams");
     asm volatile("mov    x1, x14");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x70");
+    asm volatile("sub    sp, x29, 0x50");
     asm volatile("b      LZW_20181106");
     
     asm volatile("LZW_20181105:");
@@ -332,16 +363,17 @@ void ZWInvocation(void **sp) __attribute__((optnone)) {
     asm volatile("LZW_20181112:");
     asm volatile("bl     _ZWLoadParams");
     asm volatile("blr    x17");
-    asm volatile("sub    sp, x29, 0x70");
+    asm volatile("sub    sp, x29, 0x50");
     asm volatile("LZW_20181106:");
-}
-
-void ZWBeforeInvocation(void **sp) {
-    ZWAopInvocation(sp, _ZWBeforeIMP, ZWAopOptionBefore);
+    asm volatile("ldr    x0, %0": "=m"(frameLenth));
 }
 
 
-//MARK:register or remove
+OS_ALWAYS_INLINE NSInteger ZWAfterInvocation(void **sp, NSInteger frameLength) {
+    return ZWAopInvocation(sp, _ZWAfterIMP, ZWAopOptionAfter, &frameLength);
+}
+
+#pragma mark - register or remove
 
 OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     unsigned int count = 0;
@@ -350,7 +382,7 @@ OS_ALWAYS_INLINE Method ZWGetMethod(Class cls, SEL sel) {
     for (int i = 0; i < count; ++i) {
         Method m = list[i];
         SEL s = method_getName(m);
-        if (sel_isEqual(s, sel)) {
+        if (OS_EXPECT(sel_isEqual(s, sel), 0)) {
             retMethod = m;
         }
     }
@@ -364,23 +396,24 @@ OS_ALWAYS_INLINE void ZWAddInvocation(__unsafe_unretained NSMutableDictionary *d
                                       __unsafe_unretained NSNumber *selKey,
                                       __unsafe_unretained id block,
                                       ZWAopOption options) {
-    NSArray *tmp = dict[(id<NSCopying>)class][selKey];
-    if (options & ZWAopOptionOnly) {
-        dict[(id<NSCopying>)class][selKey] = block;
+    NSMutableDictionary *invocations = dict[(id<NSCopying>)class];
+    NSArray *tmp = invocations[selKey];
+    if (OS_EXPECT(options & ZWAopOptionOnly, 0)) {
+        invocations[selKey] = block;
     } else {
         if ([tmp isKindOfClass:[NSArray class]]) {
-            dict[(id<NSCopying>)class][selKey] = [tmp arrayByAddingObject:block];
+            invocations[selKey] = [tmp arrayByAddingObject:block];
         } else if (!tmp) {
-            dict[(id<NSCopying>)class][selKey] = @[block];
+            invocations[selKey] = @[block];
         }
     }
 }
 
 id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
-    if (!obj || !sel || !block) return nil;
-    if (options == ZWAopOptionOnly
-        || options == ZWAopOptionMeta
-        || options == (ZWAopOptionMeta | ZWAopOptionOnly)) return nil;
+    if (OS_EXPECT(!obj || !sel || !block, 0)) return nil;
+    if (OS_EXPECT(options == ZWAopOptionOnly
+                  || options == ZWAopOptionMeta
+                  || options == (ZWAopOptionMeta | ZWAopOptionOnly), 0)) return nil;
     
     
     Class class = object_isClass(obj) ? obj : object_getClass(obj);
@@ -390,7 +423,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     
     Method method = ZWGetMethod(class, sel);//class_getInstanceMethod(class, sel)会获取父类的方法
     IMP originImp = method_getImplementation(method);
-    NSNumber *selKey = ZWGetSelectorKey(sel);
+    NSNumber *selKey = @((NSUInteger)(void *)sel);
     
     
     ZWLock(_ZWLock);
@@ -403,7 +436,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     if (options & ZWAopOptionReplace) {
         _ZWOriginIMP[(id<NSCopying>)class][selKey] = block;
     } else {
-        if (originImp != ZWGlobalOCSwizzle) {
+        if (OS_EXPECT(originImp != ZWGlobalOCSwizzle, 1)) {
             _ZWOriginIMP[(id<NSCopying>)class][selKey] = [NSValue valueWithPointer:originImp];
         }
     }
@@ -417,6 +450,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     ZWUnlock(_ZWLock);
     method_setImplementation(method, ZWGlobalOCSwizzle);
     
+    //这里可以提前调用ZWFrameLength预缓存frameLength
     return block;
 }
 
@@ -428,26 +462,27 @@ OS_ALWAYS_INLINE void ZWRemoveInvocation(__unsafe_unretained NSMutableDictionary
         dict[(id<NSCopying>)class] = [NSMutableDictionary dictionary];
         return;
     }
+    NSMutableDictionary *invocations = dict[(id<NSCopying>)class];
     
-    NSArray *allKeys = [dict[(id<NSCopying>)class] allKeys];
+    NSArray *allKeys = [invocations allKeys];
     for (NSNumber *key in allKeys) {
-        id obj = dict[(id<NSCopying>)class][key];
+        id obj = invocations[key];
         if ([obj isKindOfClass:_ZWBlockClass]) {
             if (obj == identifier) {
-                dict[(id<NSCopying>)class][key] = nil;
+                invocations[key] = nil;
             }
         } else if ([obj isKindOfClass:[NSArray class]]) {
             NSMutableArray *arr = [NSMutableArray array];
             for (id block in obj) {
                 if (block != identifier) {
                     if (options & ZWAopOptionRemoveAop) {
-                        dict[(id<NSCopying>)class][key] = nil;
+                        invocations[key] = nil;
                         break;
                     }
                     [arr addObject:block];
                 }
             }
-            dict[(id<NSCopying>)class][key] = [arr copy];;
+            invocations[key] = [arr copy];;
         }
     }
 }
@@ -474,8 +509,7 @@ void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {
     }
     ZWUnlock(_ZWLock);
 }
-
-//MARK:convenient api
+#pragma mark - convenient api
 
 id ZWAddAopBefore(id obj, SEL sel, id block) {
     return ZWAddAop(obj, sel, ZWAopOptionBefore, block);
@@ -502,7 +536,7 @@ void ZWRemoveAopClassMethod(id obj, id identifier, ZWAopOption options) {
 }
 
 #else
-//MARK:placeholder
+#pragma mark - placeholder
 id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {}
 void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {}
 id ZWAddAopBefore(id obj, SEL sel, id block){}

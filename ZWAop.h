@@ -12,13 +12,19 @@ typedef NS_OPTIONS(NSInteger, ZWAopOption) {
     ZWAopOptionReplace = 1,
     ZWAopOptionBefore = 1 << 1,
     ZWAopOptionAfter = 1 << 2,
-    ZWAopOptionDefault = ZWAopOptionReplace | ZWAopOptionBefore | ZWAopOptionAfter,
-
+    ZWAopOptionBeforeAfter = ZWAopOptionBefore | ZWAopOptionAfter,
+    ZWAopOptionAll = ZWAopOptionReplace | ZWAopOptionBefore | ZWAopOptionAfter,
+    
     //以下option只能与上面的混合使用，不能单独使用
     ZWAopOptionOnly = 1 << 11,
     ZWAopOptionMeta = 1 << 12,
     ZWAopOptionRemoveAop = 1 << 13,
 };
+typedef struct ZWAopInfo {
+    __unsafe_unretained id obj;
+    SEL sel;
+    ZWAopOption opt;
+} ZWAopInfo;
 
 #ifdef __cplusplus
 extern "C" {
