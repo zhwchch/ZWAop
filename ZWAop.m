@@ -9,7 +9,6 @@
 #import "ZWAop.h"
 
 #if defined(__arm64__)
-
 #import <objc/runtime.h>
 #import <os/lock.h>
 #import <pthread.h>
@@ -152,7 +151,7 @@ OS_ALWAYS_INLINE void ZWGlobalOCSwizzle(void) {
     asm volatile("str    x0, [sp, #0xa0]");
     asm volatile("str    d0, [sp, #0xa8]");
     
-    asm volatile("mov    x1, x0");
+    asm volatile("mov    x1, x9");
     asm volatile("mov    x0, sp");
     asm volatile("bl    _ZWAfterInvocation");
     
@@ -292,12 +291,14 @@ OS_ALWAYS_INLINE NSInteger ZWAopInvocation(void **sp,
     if (OS_EXPECT(!obj || !sel, 0)) return 0;
     __unsafe_unretained id invocations = nil;
     NSInteger count = ZWGetInvocationCount(allInvocation, &invocations, obj, sel);
+    //这里最好保持一个强引用，如果在调用过程中，调用正好被移除，可能会crash。
+    id invocationsStrong = invocations;
     
     //以前是用NSArray来作为容器，但使用结构体后，可以大幅提高性能
     ZWAopInfo info = {obj, sel, option};
     NSInteger frameLength = frameLengthPtr ? *frameLengthPtr : ZWFrameLength(obj, sel) - 0xe0;
     for (int i = 0; i < count; ++i) {
-        ZWAopInvocationCall(sp, allInvocation, invocations, obj, sel, &info, i, frameLength);
+        ZWAopInvocationCall(sp, allInvocation, invocationsStrong, obj, sel, &info, i, frameLength);
     }
     return frameLength;
 }
@@ -370,7 +371,7 @@ void ZWInvocation(void **sp, NSInteger frameLenth) __attribute__((optnone)) {
     asm volatile("blr    x17");
     asm volatile("sub    sp, x29, 0x50");
     asm volatile("LZW_20181106:");
-    asm volatile("ldr    x0, %0": "=m"(frameLenth));
+    asm volatile("ldr    x9, [x29, #-0x10]");//回传frameLength给ZWAfterInvocation使用
 }
 
 
