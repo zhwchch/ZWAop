@@ -33,23 +33,13 @@ static NSMutableDictionary  *_ZWAfterIMP;
 static NSMutableDictionary  *_ZWAllSigns;
 static Class _ZWBlockClass;
 
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-API_AVAILABLE(ios(10.0))
-static os_unfair_lock_t _ZWLock;
-#else
-static pthread_mutex_t _ZWLock;
-#endif
+static pthread_rwlock_t _ZWLock;
+
 
 __attribute__((constructor(2018))) void ZWInvocationInit() {
     
-#if __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_10_0
-    if (@available(iOS 10.0, *)) {
-        _ZWLock = malloc(sizeof(os_unfair_lock));
-        _ZWLock->_os_unfair_lock_opaque = 0;
-    }
-#else
-    pthread_mutex_init(&_ZWLock, NULL);
-#endif
+    pthread_rwlock_init(&_ZWLock, NULL);
+    
     _ZWOriginIMP = [NSMutableDictionary dictionary];
     _ZWBeforeIMP = [NSMutableDictionary dictionary];
     _ZWAfterIMP = [NSMutableDictionary dictionary];
@@ -77,6 +67,15 @@ OS_ALWAYS_INLINE void ZWUnlock(void *lock) {
 #endif
 }
 
+OS_ALWAYS_INLINE void ZWRWRLock(pthread_rwlock_t *lock) {
+    pthread_rwlock_rdlock(lock);
+}
+OS_ALWAYS_INLINE void ZWRWWLock(pthread_rwlock_t *lock) {
+    pthread_rwlock_wrlock(lock);
+}
+OS_ALWAYS_INLINE void ZWRWUnlock(pthread_rwlock_t *lock) {
+    pthread_rwlock_unlock(lock);
+}
 #pragma mark - erery invocation
 
 OS_ALWAYS_INLINE void ZWStoreParams(void) {
@@ -188,12 +187,12 @@ OS_ALWAYS_INLINE NSUInteger ZWFrameLength(__unsafe_unretained id obj, SEL sel) {
     Class class = object_getClass(obj);
     if (OS_EXPECT(!class || !sel, 0)) return 0xe0;
     
-    ZWLock(_ZWLock);
+    ZWRWRLock(&_ZWLock);
     __unsafe_unretained NSMutableDictionary *methodSigns = _ZWAllSigns[(id<NSCopying>)class];
     //利用Tagged Pointer机制，选用NSNumber包裹selector地址常量作为key，效率比使用字符串高很多
     id selKey = @((NSUInteger)(void *)sel);
     __unsafe_unretained NSNumber *num = methodSigns[selKey];
-    ZWUnlock(_ZWLock);
+    ZWRWUnlock(&_ZWLock);
     if (OS_EXPECT(num != nil, 1))  return [num unsignedLongLongValue];
     
     Method method = class_isMetaClass(class) ? class_getClassMethod(class, sel) : class_getInstanceMethod(class, sel);
@@ -201,21 +200,21 @@ OS_ALWAYS_INLINE NSUInteger ZWFrameLength(__unsafe_unretained id obj, SEL sel) {
     NSMethodSignature *sign = [NSMethodSignature signatureWithObjCTypes:type];
     NSUInteger frameLength = [sign frameLength];
     
-    ZWLock(_ZWLock);
+    ZWRWWLock(&_ZWLock);
     if (OS_EXPECT(!methodSigns, 0)) {
         _ZWAllSigns[(id<NSCopying>)class] = [NSMutableDictionary dictionaryWithObject:@(frameLength) forKey:selKey];
     } else {
         methodSigns[selKey] = @(frameLength);
     }
-    ZWUnlock(_ZWLock);
+    ZWRWUnlock(&_ZWLock);
     return frameLength;
 }
 
 OS_ALWAYS_INLINE void *ZWGetInvocation(__unsafe_unretained NSDictionary *dict, __unsafe_unretained id obj, SEL sel) {
     if (!obj || !sel) return nil;
-    ZWLock(_ZWLock);
+    ZWRWWLock(&_ZWLock);
     __unsafe_unretained id invocation = dict[(id<NSCopying>)object_getClass(obj)][@((NSUInteger)(void *)sel)];
-    ZWUnlock(_ZWLock);
+    ZWRWUnlock(&_ZWLock);
     return (__bridge void *)invocation;
 }
 
@@ -286,7 +285,7 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("ldr    x14, %0": "=m"(infoP));
     asm volatile("ldr    x11, %0": "=m"(sp));
     asm volatile("ldr    x13, %0": "=m"(frameLenth));
-    asm volatile("ldr    x15, %0": "=m"(block));
+    asm volatile("ldr    x16, %0": "=m"(block));
     asm volatile("cbz    x13, LZW_20181110");
     asm volatile("add    x12, x11, " ZWGlobalOCSwizzleStackSize);
     asm volatile("add    x12, x12, 0x10");//ZWGlobalOCSwizzleStackSize + 0x10
@@ -296,7 +295,7 @@ void ZWAopInvocationCall(void **sp,
     asm volatile("LZW_20181110:");
     asm volatile("bl     _ZWLoadParams");
     asm volatile("mov    x1, x14");
-    asm volatile("mov    x0, x15");
+    asm volatile("mov    x0, x16");
     asm volatile("blr    x17");
     asm volatile("sub    sp, x29, " ZWAopInvocationCallStackSize);
     asm volatile("LZW_20181107:");
@@ -453,7 +452,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     NSNumber *selKey = @((NSUInteger)(void *)sel);
     
     
-    ZWLock(_ZWLock);
+    ZWRWRLock(&_ZWLock);
     if (!_ZWOriginIMP[(id<NSCopying>)class]) {
         _ZWOriginIMP[(id<NSCopying>)class] = [NSMutableDictionary dictionary];
         _ZWBeforeIMP[(id<NSCopying>)class] = [NSMutableDictionary dictionary];
@@ -474,7 +473,7 @@ id ZWAddAop(id obj, SEL sel, ZWAopOption options, id block) {
     if (options & ZWAopOptionAfter) {
         ZWAddInvocation(_ZWAfterIMP, class, selKey, block, options);
     }
-    ZWUnlock(_ZWLock);
+    ZWRWUnlock(&_ZWLock);
     method_setImplementation(method, ZWGlobalOCSwizzle);
     
     //这里可以提前调用ZWFrameLength预缓存frameLength
@@ -522,7 +521,7 @@ void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {
         class = class_isMetaClass(class) ? class : object_getClass(obj);
     }
     
-    ZWLock(_ZWLock);
+    ZWRWWLock(&_ZWLock);
     if (options & ZWAopOptionReplace) {
         ZWRemoveInvocation(_ZWOriginIMP, class, identifier, options);
     }
@@ -534,7 +533,7 @@ void ZWRemoveAop(id obj, id identifier, ZWAopOption options) {
     if (options & ZWAopOptionAfter) {
         ZWRemoveInvocation(_ZWAfterIMP, class, identifier, options);
     }
-    ZWUnlock(_ZWLock);
+    ZWRWUnlock(&_ZWLock);
 }
 #pragma mark - convenient api
 
